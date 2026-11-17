@@ -581,6 +581,6 @@ document.addEventListener("DOMContentLoaded", function() {
 });
 ```
 
-
-
-The code that generated these maps and figures: [github.com/bvarick/evanston_crashes](https://github.com/bvarick/evanston_crashes)
+<br>
+<br>
+See here for the code that generated these maps and figures: [github.com/bvarick/evanston_crashes](https://github.com/bvarick/evanston_crashes)
