@@ -580,3 +580,7 @@ document.addEventListener("DOMContentLoaded", function() {
   }, 300);
 });
 ```
+
+
+
+The code that generated these maps and figures: [github.com/bvarick/evanston_crashes](https://github.com/bvarick/evanston_crashes)
