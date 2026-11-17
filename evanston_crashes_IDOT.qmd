@@ -1,0 +1,581 @@
+---
+title: "Pedestrian & Bicycle Crashes in Evanston, IL"
+subtitle: "Car crashes involving someone walking or riding a bike: 2014-2025"
+format:
+  html:
+    toc: false
+    toc-depth: 2
+    theme: cosmo
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r setup}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(leaflet)
+library(ggiraph)
+library(crosstalk)
+
+data_dir <- "data/IDOT_crashes"
+cache_file <- "data/idot_evanston_crashes.rds"
+
+files <- sort(list.files(
+  data_dir,
+  pattern = "\\.geojson$",
+  full.names = TRUE,
+  ignore.case = TRUE
+))
+
+if (length(files) == 0L) {
+  stop("No GeoJSON files found in: ", data_dir)
+}
+
+boundary_file <- "data/evanston_boundary.geojson"
+
+if (!file.exists(boundary_file)) {
+  stop("Missing Evanston boundary file: ", boundary_file)
+}
+
+evanston_boundary <- st_read(boundary_file, quiet = TRUE)
+
+if (is.na(st_crs(evanston_boundary))) {
+  stop("The Evanston boundary has no coordinate reference system.")
+}
+
+evanston_boundary <- evanston_boundary |>
+  st_make_valid() |>
+  st_transform(4326)
+
+boundary_geometry <- st_union(st_geometry(evanston_boundary))
+
+if (
+  length(boundary_geometry) == 0L ||
+  any(st_is_empty(boundary_geometry)) ||
+  !all(st_geometry_type(boundary_geometry) %in% c("POLYGON", "MULTIPOLYGON"))
+) {
+  stop("The Evanston boundary must contain nonempty polygon geometry.")
+}
+
+# Track both crash files and the boundary so either change rebuilds the cache.
+tracked_files <- c(files, boundary_file)
+file_info <- file.info(tracked_files)
+
+source_manifest <- tibble(
+  file = normalizePath(tracked_files),
+  size = file_info$size,
+  modified = as.numeric(file_info$mtime)
+)
+
+# Increment this version if the processing rules below change.
+cache_version <- 4L
+
+cached <- if (file.exists(cache_file)) {
+  readRDS(cache_file)
+} else {
+  NULL
+}
+
+cache_is_current <- is.list(cached) &&
+  identical(cached$version, cache_version) &&
+  identical(cached$sources, source_manifest)
+
+injury_levels <- c(
+  "No Apparent Injury",
+  "Possible Injury",
+  "Suspected Minor Injury",
+  "Suspected Serious Injury",
+  "Fatal Injury",
+  "Unknown"
+)
+
+if (cache_is_current) {
+  evanston_crashes <- cached$data
+} else {
+  # Select only common fields needed for this analysis.
+  required_fields <- c(
+    "CrashID",
+    "CityName",
+    "CrashYr",
+    "CrashMonth",
+    "CrashDay",
+    "TypeOfFirstCrash",
+    "TotalFatals",
+    "TotalInjured",
+    "AInjuries",
+    "BInjuries",
+    "CInjuries"
+  )
+
+  numeric_fields <- c(
+    "CrashYr",
+    "CrashMonth",
+    "CrashDay",
+    "TotalFatals",
+    "TotalInjured",
+    "AInjuries",
+    "BInjuries",
+    "CInjuries"
+  )
+
+  read_evanston_crashes <- function(file) {
+    message("Reading ", basename(file))
+
+    crashes <- st_read(file, quiet = TRUE)
+
+    # Normalize the year column used by the 2025 schema.
+    # Keep CrashYr as the common name for downstream processing.
+    if (!"CrashYr" %in% names(crashes) &&
+        "CrashYear" %in% names(crashes)) {
+      crashes <- crashes |>
+        rename(CrashYr = CrashYear)
+    }
+    
+    missing_fields <- setdiff(required_fields, names(crashes))
+
+    if (length(missing_fields) > 0L) {
+      stop(
+        basename(file),
+        " is missing required fields: ",
+        paste(missing_fields, collapse = ", ")
+      )
+    }
+
+    if (is.na(st_crs(crashes))) {
+      stop("Missing coordinate reference system in: ", basename(file))
+    }
+
+    # Select the common attributes and use the supplied GIS geometry.
+    crashes <- crashes |>
+      select(all_of(required_fields)) |>
+      mutate(
+        CrashID = as.character(CrashID),
+        across(all_of(numeric_fields), as.numeric),
+        source_file = basename(file)
+      ) |>
+      st_transform(4326)
+
+    # Normalize two-digit source years, such as 14, to four digits.
+    # These source files cover years in the 2000s.
+    crashes <- crashes |>
+      mutate(
+        CrashYr = as.integer(if_else(
+          between(CrashYr, 0, 99),
+          CrashYr + 2000,
+          CrashYr
+        ))
+      )
+
+    if (anyNA(crashes$CrashYr) ||
+        any(!between(crashes$CrashYr, 2000, 2099))) {
+      stop("Missing or unexpected crash years in: ", basename(file))
+    }
+
+    # Use location rather than the reported municipality.
+    # Empty geometries and points outside Evanston are excluded.
+    inside_evanston <- lengths(
+      st_intersects(crashes, boundary_geometry)
+    ) > 0L
+
+    crashes[inside_evanston, ]
+  }
+
+
+  annual_crashes <- lapply(files, read_evanston_crashes)
+  crashes_raw <- bind_rows(annual_crashes)
+
+  if (nrow(crashes_raw) == 0L) {
+    stop("No crash locations intersect the Evanston boundary.")
+  }
+
+  # Save the reported crash-type distribution for auditing the selection.
+  crash_type_audit <- crashes_raw |>
+    st_drop_geometry() |>
+    count(TypeOfFirstCrash, sort = TRUE)
+
+  write_csv(
+    crash_type_audit,
+    file.path(data_dir, "evanston_crash_type_audit.csv")
+  )
+
+  crashes_prepared <- crashes_raw |>
+    mutate(
+      # Replace terminology using descriptive labels, not assumed numeric codes.
+      crash_type_text = str_to_upper(str_squish(TypeOfFirstCrash)),
+      collision_mode = case_when(
+        str_detect(crash_type_text, "PEDESTRIAN") ~ "Pedestrian",
+        str_detect(crash_type_text, "PEDALCYCL|BICYCL") ~ "Bicyclist",
+        TRUE ~ "Other"
+      )
+    ) |>
+    filter(collision_mode %in% c("Pedestrian", "Bicyclist")) |>
+    mutate(
+      # Build the date from the separate year, month, and day fields.
+      # Do not infer a time until TimeOfCrash / CrashHour values are verified.
+      year = as.integer(CrashYr),
+      crash_date = make_date(
+        year = year,
+        month = as.integer(CrashMonth),
+        day = as.integer(CrashDay)
+      ),
+
+      # Derive the most serious injury recorded anywhere in the crash.
+      # Missing counts are not automatically treated as zero.
+      Most_Serious_Injury = case_when(
+        TotalFatals > 0 ~ "Fatal Injury",
+        AInjuries > 0 ~ "Suspected Serious Injury",
+        BInjuries > 0 ~ "Suspected Minor Injury",
+        CInjuries > 0 ~ "Possible Injury",
+        TotalFatals == 0 & TotalInjured == 0 ~ "No Apparent Injury",
+        TRUE ~ "Unknown"
+      ),
+      Most_Serious_Injury = factor(
+        Most_Serious_Injury,
+        levels = injury_levels
+      )
+    ) |>
+    select(-crash_type_text)
+
+  if (nrow(crashes_prepared) == 0L) {
+    stop(
+      "No pedestrian or bicycle crash types matched. ",
+      "Inspect data/IDOT_crashes/evanston_crash_type_audit.csv."
+    )
+  }
+
+  if (anyNA(crashes_prepared$crash_date)) {
+    stop(
+      "Some selected crashes have missing or invalid dates. ",
+      "Inspect CrashYr, CrashMonth, and CrashDay before continuing."
+    )
+  }
+
+  evanston_crashes <- crashes_prepared
+
+  # Cache the processed GIS dataset separately from the old geocoding cache.
+  saveRDS(
+    list(
+      version = cache_version,
+      sources = source_manifest,
+      data = evanston_crashes
+    ),
+    cache_file
+  )
+}
+
+# Exclude empty geometries and unknown severity from the map only.
+map_crashes <- evanston_crashes |>
+  filter(
+    !st_is_empty(geometry),
+    Most_Serious_Injury != "Unknown"
+  ) |>
+  mutate(
+    Most_Serious_Injury = droplevels(Most_Serious_Injury)
+  )
+
+
+if (nrow(map_crashes) == 0L) {
+  stop("The selected crashes have no nonempty map geometries.")
+}
+
+# Use the supplied geometry to describe the location without reverse geocoding.
+coordinates <- st_coordinates(map_crashes)
+
+map_crashes$crash_location <- sprintf(
+  "%.5f, %.5f",
+  coordinates[, "Y"],
+  coordinates[, "X"]
+)
+
+data_period <- paste(range(evanston_crashes$year), collapse = "–")
+
+# Use explicit four-digit labels for the map's year controls.
+map_crashes <- map_crashes |>
+  mutate(year_label = sprintf("%04d", year))
+
+```
+
+
+### Notes on the data:
+
+- These are crashes that the Illinois Department of Transportation compiles and publishes.
+- "Suspected Serious Injury" means something like life-threatening, "Suspected Minor Injury" is for anything not immediately life threatening (including a broken rib or femur).
+
+## Map
+
+Use the controls on the left to filter the crash markers by year, injury severity, and vulnerable user. 
+
+```{r map}
+
+# Create SharedData object for Crosstalk filtering
+shared_crashes <- SharedData$new(map_crashes)
+
+# Define color palette matching the original YlOrRd scheme
+# Define explicit color mapping
+injury_colors <- c(
+  "No Apparent Injury"       = "#999999",
+  "Possible Injury"          = "#FECC5C",
+  "Suspected Minor Injury"    = "#FD8D3C",
+  "Suspected Serious Injury"  = "#E31A1C",
+  "Fatal Injury"             = "#800026",
+  "Unknown"                  = "#756BB1"
+)
+
+pal <- colorFactor(
+  palette = unname(injury_colors),
+  domain = injury_levels,
+  levels = injury_levels,
+  ordered = TRUE
+)
+
+# Build a separate legend containing only known injury severities.
+map_legend_levels <- injury_levels[injury_levels != "Unknown"]
+
+map_legend <- htmltools::tags$div(
+  style = "padding: 10px; font-size: 13px;",
+  htmltools::tags$strong("Injury Severity"),
+  lapply(map_legend_levels, function(level) {
+    htmltools::tags$div(
+      style = "display: flex; align-items: center; margin-top: 8px;",
+      htmltools::tags$span(
+        style = paste0(
+          "display: inline-block; flex-shrink: 0; ",
+          "width: 12px; height: 12px; margin-right: 8px; ",
+          "border: 1px solid #444444; border-radius: 50%; ",
+          "background-color: ", injury_colors[[level]], ";"
+        )
+      ),
+      htmltools::tags$span(level)
+    )
+  })
+)
+
+# Layout filters and map side-by-side
+bscols(
+  widths = c(3, 9),
+  list(
+    filter_checkbox("year", "Year", shared_crashes, ~year_label),
+    filter_checkbox("injury", "Injury Severity", shared_crashes, ~Most_Serious_Injury, allLevels = TRUE),
+    filter_checkbox("type", "Road user type", shared_crashes, ~collision_mode)
+  ),
+  leaflet(
+    shared_crashes,
+    width = "100%",
+    height = 550,
+#    options = leafletOptions(maxZoom = 22)
+  ) |>
+#    addProviderTiles(
+#      "Esri.WorldGrayCanvas",
+#      options = providerTileOptions(
+#        maxNativeZoom = 16,
+#        maxZoom = 22
+#      )
+#    ) |>
+    #addProviderTiles("OpenStreetMap.Mapnik") |>
+    #addProviderTiles("Esri.WorldGrayCanvas") |>
+    addProviderTiles(providers$Stadia.AlidadeSmooth) |>
+    addCircleMarkers(
+      radius = 6,
+      fillColor = ~pal(Most_Serious_Injury),
+      fillOpacity = 0.85,
+      color = "#444444",
+      weight = 1,
+      popup = ~paste0(
+      "<strong>Coordinates:</strong> ", crash_location, "<br/>",
+      "<strong>Road user type:</strong> ", collision_mode, "<br/>",
+      "<strong>Crash severity:</strong> ", Most_Serious_Injury, "<br/>",
+      "<strong>Date:</strong> ", format(crash_date, "%B %d, %Y")
+      )
+    ),
+  map_legend
+)
+```
+      
+## Crash Trends over Time
+
+```{r barGraph}
+#| fig-width: 11
+#| fig-height: 7
+#| column: page
+
+# Aggregate crash counts by year, collision type, and injury severity.
+crashes_summary <- evanston_crashes |>
+  st_drop_geometry() |>
+  filter(collision_mode %in% c("Bicyclist", "Pedestrian")) |>
+  mutate(
+    year = as.integer(as.character(year)),
+    Most_Serious_Injury = factor(
+      Most_Serious_Injury,
+      levels = c(
+        "Fatal Injury",
+        "Suspected Serious Injury",
+        "Suspected Minor Injury",
+        "Possible Injury",
+        "No Apparent Injury"
+      )
+    )
+  ) |>
+  count(
+    year,
+    collision_mode,
+    Most_Serious_Injury,
+    name = "total"
+  ) |>
+  mutate(
+    tooltip = paste0(
+      "Year: ", sprintf("%04d", year),
+      "\nRoad user: ", collision_mode,
+      "\nCrash severity: ", Most_Serious_Injury,
+      "\nCrashes: ", total
+    ),
+    bar_id = paste(
+      year,
+      collision_mode,
+      Most_Serious_Injury,
+      sep = "-"
+    )
+  )
+
+# Calculate totals for labels above each annual bar.
+annual_totals <- crashes_summary |>
+  group_by(year, collision_mode) |>
+  summarise(total = sum(total), .groups = "drop")
+
+plot_years <- seq(
+  min(crashes_summary$year),
+  max(crashes_summary$year)
+)
+
+# Compare annual totals while retaining the injury-severity breakdown.
+p <- ggplot(
+  crashes_summary,
+  aes(
+    x = year,
+    y = total,
+    fill = Most_Serious_Injury,
+    group = Most_Serious_Injury
+  )
+) +
+  geom_col_interactive(
+    aes(
+      tooltip = tooltip,
+      data_id = bar_id
+    ),
+    width = 0.75,
+    position = position_stack(reverse = TRUE)
+  ) +
+  geom_text(
+    data = annual_totals,
+    aes(
+      x = year,
+      y = total,
+      label = total
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.5,
+    size = 5
+  ) +
+  scale_fill_manual(
+    values = injury_colors,
+    name = "Most serious injury in crash",
+    drop = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = plot_years,
+    labels = function(x) sprintf("%04d", as.integer(x))
+  ) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 5),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  # Use the same vertical scale in both panels for direct comparison.
+  facet_wrap(
+    vars(collision_mode),
+    ncol = 1,
+    scales = "fixed"
+  ) +
+  labs(
+    title = "Evanston Crashes Involving Pedestrians & Bicyclists",
+    subtitle = paste("Annual IDOT crash counts:", data_period),
+    x = NULL,
+    y = "Number of crashes",
+    caption = paste(
+      "Labels show annual totals.",
+      "Severity is the most serious injury anywhere in the crash."
+    )
+  ) +
+  guides(
+    fill = guide_legend(nrow = 2, byrow = TRUE)
+  ) +
+theme_minimal(base_size = 16) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing = grid::unit(1.5, "lines"),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16),
+    strip.text = element_text(
+      face = "bold",
+      size = 16,
+      hjust = 0
+    ),
+    legend.position = "bottom",
+    legend.title.position = "top",
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 14),
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    plot.caption = element_text(size = 12, hjust = 0)
+  )
+
+# Render the interactive plot
+girafe(
+  ggobj = p,
+  width_svg = 11,
+  height_svg = 7,
+  options = list(
+#    opts_hover(css = "opacity:0.8;cursor:pointer;"),
+#    opts_hover_inv(css = "opacity:0.5;"),
+#    opts_tooltip(css = "font-size:16px;"),
+    opts_sizing(rescale = TRUE)
+  )
+)
+```
+
+
+```{js}
+document.addEventListener("DOMContentLoaded", function() {
+  setTimeout(function() {
+    // 1. Check ALL Year checkboxes
+    document.querySelectorAll('#year input[type="checkbox"]').forEach(function(cb) {
+      cb.checked = true;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    // 2. Check ALL Collision Type checkboxes (Bicycle & Pedestrian)
+    document.querySelectorAll('#type input[type="checkbox"]').forEach(function(cb) {
+      cb.checked = true;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    
+    // 3. Check selected Injury Severities
+    const targetInjuries = [
+     "Suspected Minor Injury",
+     "Suspected Serious Injury",
+     "Fatal Injury"   
+    ];
+    document.querySelectorAll('#injury input[type="checkbox"]').forEach(function(cb) {
+    if (targetInjuries.includes(cb.value)) {
+    cb.checked = true;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  }, 300);
+});
+```

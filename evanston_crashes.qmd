@@ -1,0 +1,234 @@
+---
+title: "Evanston Pedestrian & Bicycle Crashes"
+subtitle: "Car crashes involving someone walking or riding a bike: June 2025 - Sept. 2026"
+format:
+  html:
+    toc: false
+    toc-depth: 2
+    theme: cosmo
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r setup}
+# Load required libraries
+library(tidyverse)
+library(readxl)
+library(sf)
+library(tidygeocoder)
+library(leaflet)
+library(ggiraph)
+library(crosstalk)
+library(RColorBrewer)
+
+cache_file <- "data/geocoded_crashes.rds"
+
+if (file.exists(cache_file)) {
+  evanston_crashes <- read_rds(cache_file)
+} else {
+  # Read raw Excel file
+  crashes_raw <- read_csv("data/Crash audit with citations 061625 - 091526 (1).csv",
+                            col_types = "ccccccc")
+  
+  # Construct search strings for geocoding
+  crashes_prepared <- crashes_raw |> 
+    filter_out(is.na(`Crash Number`)) |> 
+    mutate(
+      # Replace terminology
+      collision_mode = recode_values(`Collision Type`,
+                                     "PEDALCYCLIST" ~ "Bicyclist",
+                                     "PEDESTRIAN" ~ "Pedestrian",
+                                     default = "Vehicle-Vehicle"),
+      
+      # Text to titlecase
+      `Most Serious Injury` = str_to_title(`Most Serious Injury`),
+      
+      # Build street address query string for geocoding
+      geocode_address = case_when(
+        !is.na(`Cross Street Full`) & `Cross Street Full` != "" ~ paste0(`Primary Street Full`, " and ", `Cross Street Full`, ", Evanston, IL"),
+        TRUE ~ paste0(`Primary Street Full`, ", Evanston, IL")
+      )
+    )
+  
+  # Batch geocode addresses via ArcGIS service
+  crashes_geocoded <- crashes_prepared |> 
+    geocode(address = geocode_address, method = 'arcgis', lat = latitude, long = longitude) |> 
+    filter(!is.na(latitude) & !is.na(longitude))
+  
+  # Parse datetime, format factors, and convert to sf object
+  evanston_crashes <- crashes_geocoded |> 
+    mutate(
+      crash_datetime = mdy_hm(`Date and Time`),
+      year = year(crash_datetime),
+      Most_Serious_Injury = factor(
+        `Most Serious Injury`, 
+        levels = c(
+          "No Apparent Injury",
+          "Possible Injury",
+          "Suspected Minor Injury",
+          "Suspected Serious Injury",
+          "Fatal Injury"   
+        )
+      )
+    ) |> 
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+  
+  # Cache geocoded dataset locally
+  write_rds(evanston_crashes, cache_file)
+}
+
+```
+
+### Notes on the data:
+
+- These are crashes that the police wrote a report for and this dataset is certainly not a complete picture of crashes in Evanston.
+- "Suspected Serious Injury" means something like life-threatening, "Suspected Minor Injury" is for anything not immediately life threatening (including a broken rib or femur).
+
+## Map
+
+Use the controls on the left to filter the crash markers by year, injury severity, and vulnerable user. 
+
+```{r map}
+# Create SharedData object for Crosstalk filtering
+shared_crashes <- SharedData$new(evanston_crashes)
+
+# Define color palette matching the original YlOrRd scheme
+# Define explicit color mapping
+injury_colors <- c(
+  "No Apparent Injury"       = "#999999",
+  "Possible Injury"          = "#FECC5C",
+  "Suspected Minor Injury"   = "#FD8D3C",
+  "Suspected Serious Injury" = "#E31A1C",
+  "Fatal Injury"                 = "#800026"
+)
+
+pal <- colorFactor(palette = injury_colors, domain = evanston_crashes$Most_Serious_Injury)
+
+# Layout filters and map side-by-side
+bscols(
+  widths = c(3, 9),
+  list(
+    filter_checkbox("year", "Year", shared_crashes, ~year),
+    filter_checkbox("injury", "Injury Severity", shared_crashes, ~Most_Serious_Injury, allLevels = TRUE),
+    filter_checkbox("type", "Road user type", shared_crashes, ~collision_mode)
+  ),
+  leaflet(shared_crashes, width = "100%", height = 550) |> 
+    addProviderTiles("Esri.WorldGrayCanvas") |>
+    #addProviderTiles(providers$Stadia.AlidadeSmooth) |>
+    addCircleMarkers(
+      radius = 6,
+      fillColor = ~pal(Most_Serious_Injury),
+      fillOpacity = 0.85,
+      color = "#444444",
+      weight = 1,
+      popup = ~paste0(
+        "<strong>Location:</strong> ", geocode_address, "<br/>",
+        "<strong>Vulnerable Road User:</strong> ", collision_mode, "<br/>",
+        "<strong>Severity:</strong> ", Most_Serious_Injury, "<br/>",
+        "<strong>Date:</strong> ", format(crash_datetime, "%B %d, %Y %I:%M %p")
+      )
+    ) |> 
+    addLegend(
+      pal = pal,
+      values = evanston_crashes$Most_Serious_Injury,
+      title = "Injury Severity",
+      position = "bottomright"
+    )
+)
+```
+
+## Crash Trends over Time
+
+```{r barGraph}
+# Aggregate crash counts by year, month, collision type, and injury severity
+crashes_summary <- evanston_crashes |> 
+  filter(collision_mode != "Vehicle-Vehicle") |>
+  st_drop_geometry() |> 
+  mutate(
+    # Derive an ordered month factor (Jan–Dec) from the crash date
+    month = month(crash_datetime, label = TRUE, abbr = TRUE)
+  ) |> 
+  group_by(year, month, collision_mode, Most_Serious_Injury) |> 
+  summarise(total = n(), .groups = "drop")
+
+# Build ggplot graph with interactive geom
+p <- ggplot(
+  data = crashes_summary, 
+  aes(
+    x = month, 
+    y = total, 
+    fill = Most_Serious_Injury
+  )
+) +
+  geom_col_interactive(
+    aes(
+      tooltip = paste0(
+        "<b>Month:</b> ", month, " ", year, "<br>",
+        "<b>Collision Type:</b> ", collision_mode, "<br>",
+        "<b>Injury Severity:</b> ", Most_Serious_Injury, "<br>",
+        "<b>Crashes:</b> ", total
+      ),
+      data_id = Most_Serious_Injury
+    )
+  ) +
+  scale_fill_manual(values = injury_colors, name = "Injury Severity") +
+  # Keep all 12 months on the axis, even for partial years
+  scale_x_discrete(drop = FALSE) +
+  facet_grid(collision_mode ~ year) +
+  labs(
+    title = "Evanston Crashes Involving Pedestrians & Bicyclists",
+    subtitle = "June 2025 – Sept 2026",
+    x = "Month",
+    y = "Number of Crashes"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Render interactive ggiraph plot
+girafe(
+  ggobj = p,
+  options = list(
+    opts_hover(css = "opacity:0.8;cursor:pointer;"),
+    opts_hover_inv(css = "opacity:0.3;"),
+    opts_sizing(rescale = TRUE)
+  )
+)
+```
+
+```{js}
+document.addEventListener("DOMContentLoaded", function() {
+  setTimeout(function() {
+    // 1. Check ALL Year checkboxes
+    document.querySelectorAll('#year input[type="checkbox"]').forEach(function(cb) {
+      cb.checked = true;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    // 2. Check ALL Collision Type checkboxes (Bicycle & Pedestrian)
+    document.querySelectorAll('#type input[type="checkbox"]').forEach(function(cb) {
+      cb.checked = true;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    
+    // 3. Check selected Injury Severities
+    const targetInjuries = [
+     "Suspected Minor Injury",
+     "Suspected Serious Injury",
+     "Fatal Injury"   
+    ];
+    document.querySelectorAll('#injury input[type="checkbox"]').forEach(function(cb) {
+    if (targetInjuries.includes(cb.value)) {
+    cb.checked = true;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  }, 300);
+});
+```
