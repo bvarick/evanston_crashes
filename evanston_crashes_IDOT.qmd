@@ -408,6 +408,7 @@ bscols(
 crashes_summary <- evanston_crashes |>
   st_drop_geometry() |>
   filter(collision_mode %in% c("Bicyclist", "Pedestrian")) |>
+  filter(Most_Serious_Injury %in% c("Fatal Injury", "Suspected Serious Injury", "Suspected Minor Injury")) |> 
   mutate(
     year = as.integer(as.character(year)),
     Most_Serious_Injury = factor(
